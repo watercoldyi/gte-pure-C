@@ -17,12 +17,18 @@ except ImportError:
     print("Please install safetensors: pip install safetensors")
     sys.exit(1)
 
-def load_vocab(vocab_path):
-    """Load vocabulary from vocab.txt"""
+def load_vocab(vocab_path, target_size=None):
+    """Load vocabulary from vocab.txt, padding to target_size if needed"""
     vocab = []
     with open(vocab_path, 'r', encoding='utf-8') as f:
         for line in f:
             vocab.append(line.rstrip('\n'))
+
+    # 如果词表条目少于目标大小，用占位符填充（这些ID不会被tokenizer产出）
+    if target_size and len(vocab) < target_size:
+        for i in range(len(vocab), target_size):
+            vocab.append(f'[unused{i}]')
+
     return vocab
 
 def main():
@@ -52,9 +58,8 @@ def main():
     print(f"  intermediate_size: {intermediate_size}")
     print(f"  max_seq_length: {max_seq_length}")
 
-    # Load vocabulary
-    vocab = load_vocab(model_dir / "vocab.txt")
-    assert len(vocab) == vocab_size, f"Vocab size mismatch: {len(vocab)} vs {vocab_size}"
+    # Load vocabulary (如果实际词表小于config中的vocab_size，自动填充)
+    vocab = load_vocab(model_dir / "vocab.txt", target_size=vocab_size)
     print(f"  Loaded {len(vocab)} vocabulary entries")
 
     # Load safetensors
@@ -70,7 +75,7 @@ def main():
     # Write binary format
     with open(output_path, 'wb') as f:
         # Header
-        f.write(b'GTE1')  # Magic
+        f.write(b'GTE2')  # Magic (float16 weights, converted to float32 on load)
         f.write(struct.pack('<I', vocab_size))
         f.write(struct.pack('<I', hidden_size))
         f.write(struct.pack('<I', num_layers))
@@ -85,7 +90,8 @@ def main():
             f.write(word_bytes)
 
         def write_tensor(name):
-            tensor = tensors.get_tensor(name).astype('float32')
+            """读取 tensor（保持 float16），写入二进制，加载时 C 代码转为 float32"""
+            tensor = tensors.get_tensor(name)
             f.write(tensor.tobytes())
             return tensor.shape
 

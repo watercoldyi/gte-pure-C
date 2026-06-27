@@ -24,7 +24,7 @@
  * Constants
  * ======================================================================== */
 
-#define GTE_MAGIC "GTE1"
+#define GTE_MAGIC "GTE2"
 #define GTE_LAYER_NORM_EPS 1e-12f
 
 /* Special token IDs */
@@ -264,7 +264,7 @@ static void l2_normalize(float *x, int n) {
  * Tokenizer
  * ======================================================================== */
 
-/* Check if character is punctuation (for basic tokenization) */
+/* Check if character is ASCII punctuation */
 static int is_punctuation(unsigned char c) {
     return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
            (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
@@ -275,7 +275,55 @@ static int is_whitespace(unsigned char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-/* Basic tokenization: split on whitespace and punctuation, lowercase */
+/* Get byte length of a UTF-8 character from its leading byte */
+static int utf8_char_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1; /* invalid, treat as single byte */
+}
+
+/* Check if a UTF-8 character is CJK (CJK Unified Ideographs, etc.) */
+static int is_cjk_char(const char *p) {
+    unsigned char c = (unsigned char)*p;
+    if (c < 0x80) return 0; /* ASCII */
+    if (c < 0xE0) return 0; /* 2-byte UTF-8 (Latin extensions etc.) */
+
+    /* Decode first 3 bytes for the codepoint (most CJK are in BMP, 3-byte UTF-8) */
+    if ((c & 0xF0) == 0xE0) {
+        int cp = ((c & 0x0F) << 12) |
+                 (((unsigned char)p[1] & 0x3F) << 6) |
+                  ((unsigned char)p[2] & 0x3F);
+        /* CJK Unified Ideographs */
+        if (cp >= 0x4E00 && cp <= 0x9FFF) return 1;
+        /* CJK Unified Ideographs Extension A */
+        if (cp >= 0x3400 && cp <= 0x4DBF) return 1;
+        /* CJK Compatibility Ideographs */
+        if (cp >= 0xF900 && cp <= 0xFAFF) return 1;
+        /* Hiragana + Katakana */
+        if (cp >= 0x3040 && cp <= 0x30FF) return 1;
+        /* Full-width forms (CJK punctuation, digits, letters) */
+        if (cp >= 0xFF00 && cp <= 0xFFEF) return 1;
+        /* CJK Radicals / Kangxi */
+        if (cp >= 0x2E80 && cp <= 0x2FDF) return 1;
+        /* General punctuation (includes CJK punctuation like U+3000-U+303F) */
+        if (cp >= 0x3000 && cp <= 0x303F) return 1;
+        return 0;
+    }
+    /* 4-byte UTF-8 (CJK Extension B+, rare) */
+    if ((c & 0xF8) == 0xF0) {
+        int cp = ((c & 0x07) << 18) |
+                 (((unsigned char)p[1] & 0x3F) << 12) |
+                 (((unsigned char)p[2] & 0x3F) << 6) |
+                  ((unsigned char)p[3] & 0x3F);
+        if (cp >= 0x20000 && cp <= 0x2FFFF) return 1;
+        return 0;
+    }
+    return 0;
+}
+
+/* Basic tokenization: split on whitespace, punctuation, and CJK character boundaries */
 static char **basic_tokenize(const char *text, int *num_tokens) {
     int capacity = 64;
     char **tokens = malloc(capacity * sizeof(char *));
@@ -287,25 +335,53 @@ static char **basic_tokenize(const char *text, int *num_tokens) {
         while (*p && is_whitespace(*p)) p++;
         if (!*p) break;
 
-        /* Find end of token */
         const char *start = p;
-        if (is_punctuation(*p)) {
-            /* Single punctuation is a token */
+        unsigned char c = (unsigned char)*p;
+
+        /* 中文字符（CJK）：每个字符单独作为一个 token */
+        if (is_cjk_char(p)) {
+            p += utf8_char_len(c);
+        } else if (is_punctuation(c)) {
+            /* ASCII 标点：单个字符作为 token */
             p++;
+        } else if (c >= 0x80) {
+            /* 其他多字节 UTF-8 字符：读取完整字符，然后继续读到非字母边界 */
+            int clen = utf8_char_len(c);
+            p += clen;
+            while (*p && !is_whitespace(*p) && !is_punctuation(*p) && !is_cjk_char(p)) {
+                unsigned char nc = (unsigned char)*p;
+                if (nc >= 0x80) {
+                    int nlen = utf8_char_len(nc);
+                    if (nlen != clen) break; /* 不同长度的UTF-8，断开 */
+                    p += nlen;
+                } else {
+                    p++;
+                }
+            }
         } else {
-            /* Read until whitespace or punctuation */
-            while (*p && !is_whitespace(*p) && !is_punctuation(*p)) {
+            /* ASCII 字母/数字：读取连续的非空白/非标点/非 CJK 字符 */
+            while (*p && !is_whitespace(*p) && !is_punctuation(*p) &&
+                   !is_cjk_char(p)) {
                 p++;
             }
         }
 
-        /* Create token (lowercase) */
+        /* Create token (只对纯 ASCII 做 lowercase) */
         int len = p - start;
         char *token = malloc(len + 1);
+        int has_nonascii = 0;
         for (int i = 0; i < len; i++) {
-            token[i] = tolower((unsigned char)start[i]);
+            if ((unsigned char)start[i] >= 0x80) has_nonascii = 1;
+            token[i] = start[i];
         }
         token[len] = '\0';
+
+        /* 只对纯 ASCII token 做小写转换 */
+        if (!has_nonascii) {
+            for (int i = 0; i < len; i++) {
+                token[i] = tolower((unsigned char)token[i]);
+            }
+        }
 
         /* Add to list */
         if (count >= capacity) {
@@ -360,9 +436,9 @@ static int *wordpiece_tokenize(gte_ctx *ctx, const char *word, int *num_subtoken
         }
 
         if (found_id < 0) {
-            /* No match found, use [UNK] for this character and move on */
+            /* 未匹配：跳过下一个完整 UTF-8 字符，输出 [UNK] */
             subtokens[count++] = TOKEN_UNK;
-            start++;
+            start += utf8_char_len((unsigned char)word[start]);
         } else {
             subtokens[count++] = found_id;
             start = end;
@@ -621,13 +697,65 @@ static int read_uint16(FILE *f, int *val) {
     return 1;
 }
 
-static float *read_floats(FILE *f, int count) {
+/* IEEE 754 half (float16) to float32 conversion */
+static float f16_to_f32(unsigned short h) {
+    unsigned sign = (h >> 15) & 1;
+    unsigned exp  = (h >> 10) & 0x1F;
+    unsigned mant = h & 0x3FF;
+    unsigned result;
+
+    if (exp == 0) {
+        /* 零或非规格化数 */
+        if (mant == 0) {
+            result = sign << 31;
+        } else {
+            /* 非规格化数：规范化 */
+            exp = 1;
+            while ((mant & 0x400) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FF;
+            result = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        /* 无穷大或 NaN */
+        result = (sign << 31) | (0xFF << 23) | (mant << 13);
+    } else {
+        /* 规格化数 */
+        result = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    }
+
+    float f;
+    memcpy(&f, &result, sizeof(float));
+    return f;
+}
+
+/* 读取 float16 数据并转换为 float32 */
+static float *read_floats_f16(FILE *f, int count) {
     float *data = malloc(count * sizeof(float));
     if (!data) return NULL;
-    if (fread(data, sizeof(float), count, f) != (size_t)count) {
-        free(data);
-        return NULL;
+
+    /* 分块读取以控制内存 */
+    int chunk = 65536;
+    unsigned short *buf = malloc(chunk * sizeof(unsigned short));
+    if (!buf) { free(data); return NULL; }
+
+    int offset = 0;
+    while (offset < count) {
+        int n = count - offset;
+        if (n > chunk) n = chunk;
+        if (fread(buf, sizeof(unsigned short), n, f) != (size_t)n) {
+            free(buf);
+            free(data);
+            return NULL;
+        }
+        for (int i = 0; i < n; i++) {
+            data[offset + i] = f16_to_f32(buf[i]);
+        }
+        offset += n;
     }
+    free(buf);
     return data;
 }
 
@@ -684,11 +812,11 @@ gte_ctx *gte_load(const char *model_path) {
     }
 
     /* Read embeddings */
-    ctx->token_embeddings = read_floats(f, ctx->vocab_size * ctx->hidden_size);
-    ctx->position_embeddings = read_floats(f, ctx->max_seq_len * ctx->hidden_size);
-    ctx->token_type_embeddings = read_floats(f, 2 * ctx->hidden_size);
-    ctx->embed_ln_weight = read_floats(f, ctx->hidden_size);
-    ctx->embed_ln_bias = read_floats(f, ctx->hidden_size);
+    ctx->token_embeddings = read_floats_f16(f, ctx->vocab_size * ctx->hidden_size);
+    ctx->position_embeddings = read_floats_f16(f, ctx->max_seq_len * ctx->hidden_size);
+    ctx->token_type_embeddings = read_floats_f16(f, 2 * ctx->hidden_size);
+    ctx->embed_ln_weight = read_floats_f16(f, ctx->hidden_size);
+    ctx->embed_ln_bias = read_floats_f16(f, ctx->hidden_size);
 
     if (!ctx->token_embeddings || !ctx->position_embeddings ||
         !ctx->token_type_embeddings || !ctx->embed_ln_weight || !ctx->embed_ln_bias) {
@@ -703,23 +831,23 @@ gte_ctx *gte_load(const char *model_path) {
     for (int l = 0; l < ctx->num_layers; l++) {
         layer_weights *layer = &ctx->layers[l];
 
-        layer->query_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
-        layer->query_bias = read_floats(f, ctx->hidden_size);
-        layer->key_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
-        layer->key_bias = read_floats(f, ctx->hidden_size);
-        layer->value_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
-        layer->value_bias = read_floats(f, ctx->hidden_size);
-        layer->attn_output_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
-        layer->attn_output_bias = read_floats(f, ctx->hidden_size);
-        layer->attn_ln_weight = read_floats(f, ctx->hidden_size);
-        layer->attn_ln_bias = read_floats(f, ctx->hidden_size);
+        layer->query_weight = read_floats_f16(f, ctx->hidden_size * ctx->hidden_size);
+        layer->query_bias = read_floats_f16(f, ctx->hidden_size);
+        layer->key_weight = read_floats_f16(f, ctx->hidden_size * ctx->hidden_size);
+        layer->key_bias = read_floats_f16(f, ctx->hidden_size);
+        layer->value_weight = read_floats_f16(f, ctx->hidden_size * ctx->hidden_size);
+        layer->value_bias = read_floats_f16(f, ctx->hidden_size);
+        layer->attn_output_weight = read_floats_f16(f, ctx->hidden_size * ctx->hidden_size);
+        layer->attn_output_bias = read_floats_f16(f, ctx->hidden_size);
+        layer->attn_ln_weight = read_floats_f16(f, ctx->hidden_size);
+        layer->attn_ln_bias = read_floats_f16(f, ctx->hidden_size);
 
-        layer->ffn_inter_weight = read_floats(f, ctx->intermediate_size * ctx->hidden_size);
-        layer->ffn_inter_bias = read_floats(f, ctx->intermediate_size);
-        layer->ffn_output_weight = read_floats(f, ctx->hidden_size * ctx->intermediate_size);
-        layer->ffn_output_bias = read_floats(f, ctx->hidden_size);
-        layer->ffn_ln_weight = read_floats(f, ctx->hidden_size);
-        layer->ffn_ln_bias = read_floats(f, ctx->hidden_size);
+        layer->ffn_inter_weight = read_floats_f16(f, ctx->intermediate_size * ctx->hidden_size);
+        layer->ffn_inter_bias = read_floats_f16(f, ctx->intermediate_size);
+        layer->ffn_output_weight = read_floats_f16(f, ctx->hidden_size * ctx->intermediate_size);
+        layer->ffn_output_bias = read_floats_f16(f, ctx->hidden_size);
+        layer->ffn_ln_weight = read_floats_f16(f, ctx->hidden_size);
+        layer->ffn_ln_bias = read_floats_f16(f, ctx->hidden_size);
 
         if (!layer->query_weight || !layer->query_bias ||
             !layer->key_weight || !layer->key_bias ||
@@ -734,8 +862,8 @@ gte_ctx *gte_load(const char *model_path) {
     }
 
     /* Read pooler (not used for embeddings) */
-    ctx->pooler_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
-    ctx->pooler_bias = read_floats(f, ctx->hidden_size);
+    ctx->pooler_weight = read_floats_f16(f, ctx->hidden_size * ctx->hidden_size);
+    ctx->pooler_bias = read_floats_f16(f, ctx->hidden_size);
 
     fclose(f);
 
